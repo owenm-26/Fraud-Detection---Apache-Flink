@@ -28,11 +28,45 @@ import org.apache.flink.walkthrough.common.entity.Transaction;
  */
 public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert> {
 
-	private static final long serialVersionUID = 1L;
+	private transient ValueState<Boolean> flagState;
+	private transient ValueState<Long> timerState;
 
+	@Override
+	public void open(OpenContext openContext) {
+//		small value before flag
+		ValueStateDescriptor<Boolean> flagDescriptor = new ValueStateDescriptor<>(
+				"flag",
+				Types.BOOLEAN);
+		flagState = getRuntimeContext().getState(flagDescriptor);
+
+//		timer since flag set
+		ValueStateDescriptor<Long> timerDescriptor = new ValueStateDescriptor<>(
+				"timer-state",
+				Types.LONG);
+		timerState = getRuntimeContext().getState(timerDescriptor);
+	}
+
+	private static final long serialVersionUID = 1L;
 	private static final double SMALL_AMOUNT = 1.00;
 	private static final double LARGE_AMOUNT = 500.00;
 	private static final long ONE_MINUTE = 60 * 1000;
+
+	@Override
+	public void onTimer(long timestamp, OnTimerContext ctx, Collector<Alert> out) {
+		// remove flag after 1 minute
+		timerState.clear();
+		flagState.clear();
+	}
+
+	private void cleanUp(Context ctx) throws Exception {
+		// delete timer
+		Long timer = timerState.value();
+		ctx.timerService().deleteProcessingTimeTimer(timer);
+
+		// clean up all state
+		timerState.clear();
+		flagState.clear();
+	}
 
 	@Override
 	public void processElement(
@@ -40,9 +74,30 @@ public class FraudDetector extends KeyedProcessFunction<Long, Transaction, Alert
 			Context context,
 			Collector<Alert> collector) throws Exception {
 
-		Alert alert = new Alert();
-		alert.setId(transaction.getAccountId());
+//		Get state var
+		Boolean lastTransactionSmall = flagState.value();
 
-		collector.collect(alert);
+//		check if fraud
+		if (lastTransactionSmall == true && transaction.getAmount() > LARGE_AMOUNT){
+			Alert alert = new Alert();
+			alert.setId(transaction.getAccountId());
+
+			collector.collect(alert);
+		}
+
+//		clear flag and timer
+		cleanUp(context);
+
+//		Check if small
+		if (transaction.getAmount() < SMALL_AMOUNT){
+			flagState.update(true);
+
+//			set timer and timerState
+			long timer = context.timerService().currentProcessingTime() + ONE_MINUTE;
+			context.timerService().registerProcessingTimeTimer(timer);
+			timerState.update(timer);
+		}
+
+
 	}
 }
